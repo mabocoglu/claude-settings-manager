@@ -1,6 +1,41 @@
 import SwiftUI
 import AppKit
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+
+        DispatchQueue.main.async {
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+            NSApp.windows.first?.makeMain()
+        }
+    }
+
+    @MainActor
+    func showAboutPanel() {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .center
+
+        let credits = NSMutableAttributedString(
+            string: "Claude ayar profillerini güvenle düzenlemek, yedeklemek ve etkinleştirmek için hazırlanmış yerel macOS uygulaması.\n\nJSON form editörü • Otomatik yedekleme • Profil yönetimi",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraphStyle
+            ]
+        )
+
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "Claude Settings Manager",
+            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0",
+            .version: "Build \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1")",
+            .credits: credits
+        ])
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 struct Profile: Identifiable, Hashable {
     let id: String
     let name: String
@@ -16,14 +51,16 @@ final class SettingsStore: ObservableObject {
     @Published var status = "Ready"
     @Published var statusIsError = false
     @Published var newProfileName = ""
+    private var savedEditorText = ""
 
-    private let fm = FileManager.default
+    private let fm: FileManager
     private let claudeDir: URL
     private let activeURL: URL
     private let backupsURL: URL
 
-    init() {
-        claudeDir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
+    init(fileManager: FileManager = .default, claudeDirectory: URL? = nil) {
+        fm = fileManager
+        claudeDir = claudeDirectory ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
         activeURL = claudeDir.appendingPathComponent("settings.json")
         backupsURL = claudeDir.appendingPathComponent("backups", isDirectory: true)
         reload()
@@ -68,10 +105,17 @@ final class SettingsStore: ObservableObject {
     }
 
     func select(_ profile: Profile) {
+        guard selected?.url != profile.url else { return }
+        guard confirmDiscardingChangesIfNeeded() else { return }
+        load(profile)
+    }
+
+    private func load(_ profile: Profile) {
         selected = profile
         do {
             let rawText = try String(contentsOf: profile.url, encoding: .utf8)
             editorText = jsonTextForEditor(rawText)
+            savedEditorText = editorText
             setStatus("Loaded \(profile.name)")
         } catch {
             setError("Read failed: \(error.localizedDescription)")
@@ -85,6 +129,7 @@ final class SettingsStore: ObservableObject {
             try backup(url: selected.url, label: selected.url.lastPathComponent)
             try diskText.write(to: selected.url, atomically: true, encoding: .utf8)
             editorText = diskText
+            savedEditorText = diskText
             setStatus("Saved \(selected.name)")
             reload()
         } catch {
@@ -98,6 +143,7 @@ final class SettingsStore: ObservableObject {
             try backup(url: activeURL, label: "settings.json")
             try diskText.write(to: activeURL, atomically: true, encoding: .utf8)
             editorText = diskText
+            savedEditorText = diskText
             setStatus("Activated as ~/.claude/settings.json")
             reload()
         } catch {
@@ -106,20 +152,20 @@ final class SettingsStore: ObservableObject {
     }
 
     func saveAsProfile() {
-        let name = sanitize(newProfileName)
-        guard !name.isEmpty else {
-            setError("Profile name is empty")
-            return
-        }
-
         do {
+            let name = try JSONDocument.validatedProfileName(newProfileName)
             let diskText = try jsonTextForDisk(editorText)
             let target = claudeDir.appendingPathComponent("settings.json.\(name)")
             if fm.fileExists(atPath: target.path) {
+                guard confirmOverwrite(profileName: name) else {
+                    setStatus("Save cancelled")
+                    return
+                }
                 try backup(url: target, label: target.lastPathComponent)
             }
             try diskText.write(to: target, atomically: true, encoding: .utf8)
             editorText = diskText
+            savedEditorText = diskText
             newProfileName = ""
             setStatus("Saved profile \(name)")
             reload()
@@ -145,14 +191,15 @@ final class SettingsStore: ObservableObject {
         process.arguments = ["-lc", script]
         do {
             try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                setError("Launch failed: Terminal command exited with status \(process.terminationStatus)")
+                return
+            }
             setStatus("Claude launched in Terminal")
         } catch {
             setError("Launch failed: \(error.localizedDescription)")
         }
-    }
-
-    private func validateJSON(_ value: String) throws {
-        _ = try JSONSerialization.jsonObject(with: Data(value.utf8))
     }
 
     private func jsonTextForEditor(_ value: String) -> String {
@@ -160,12 +207,7 @@ final class SettingsStore: ObservableObject {
     }
 
     private func jsonTextForDisk(_ value: String) throws -> String {
-        let object = try JSONSerialization.jsonObject(with: Data(value.utf8))
-        let data = try JSONSerialization.data(
-            withJSONObject: object,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        )
-        return String(decoding: data, as: UTF8.self) + "\n"
+        try JSONDocument.formattedText(from: value)
     }
 
     private func backup(url: URL, label: String) throws {
@@ -175,10 +217,29 @@ final class SettingsStore: ObservableObject {
         try fm.copyItem(at: url, to: backupsURL.appendingPathComponent("\(label).\(stamp).bak"))
     }
 
-    private func sanitize(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).map { char in
-            (char.isLetter || char.isNumber || char == "-" || char == "_" || char == ".") ? char : "-"
-        }.reduce(into: "") { $0.append($1) }
+    private var hasUnsavedChanges: Bool {
+        selected != nil && editorText != savedEditorText
+    }
+
+    private func confirmDiscardingChangesIfNeeded() -> Bool {
+        guard hasUnsavedChanges else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Discard unsaved changes?"
+        alert.informativeText = "The current profile has changes that have not been saved."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Discard Changes")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func confirmOverwrite(profileName: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Overwrite profile ‘\(profileName)’?"
+        alert.informativeText = "The existing profile will be backed up before it is replaced."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Overwrite")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
 
@@ -307,12 +368,22 @@ struct ContentView: View {
     }
 }
 
-@main
 struct ClaudeSettingsManagerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
         .windowStyle(.titleBar)
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About Claude Settings Manager") {
+                    appDelegate.showAboutPanel()
+                }
+            }
+        }
     }
 }
+
+ClaudeSettingsManagerApp.main()

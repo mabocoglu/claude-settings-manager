@@ -8,7 +8,11 @@ let package = Package(
         .executable(name: "ClaudeSettingsManager", targets: ["ClaudeSettingsManager"])
     ],
     targets: [
-        .executableTarget(name: "ClaudeSettingsManager")
+        .executableTarget(name: "ClaudeSettingsManager"),
+        .testTarget(
+            name: "ClaudeSettingsManagerTests",
+            dependencies: ["ClaudeSettingsManager"]
+        )
     ],
     swiftLanguageModes: [.v6]
 )

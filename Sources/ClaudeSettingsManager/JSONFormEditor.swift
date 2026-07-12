@@ -1,21 +1,309 @@
 import SwiftUI
 import Foundation
-
-enum JSONEntryKind: String, CaseIterable, Identifiable {
-    case string
-    case bool
-    case array
-    case object
-
-    var id: String { rawValue }
-    var title: String { rawValue.capitalized }
-}
+import AppKit
 
 struct JSONEntry: Identifiable {
     let id: String
     let path: [String]
     let key: String
     let kind: JSONEntryKind
+}
+
+private struct NumberTextField: NSViewRepresentable {
+    @Binding var text: String
+    var onCommit: (() -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, onCommit: onCommit)
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let textField = NSTextField(string: text)
+        textField.placeholderString = "value"
+        textField.isBezeled = true
+        textField.bezelStyle = .roundedBezel
+        textField.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        textField.formatter = NumericInputFormatter()
+        textField.delegate = context.coordinator
+        return textField
+    }
+
+    func updateNSView(_ textField: NSTextField, context: Context) {
+        context.coordinator.text = $text
+        context.coordinator.onCommit = onCommit
+        if textField.stringValue != text {
+            textField.stringValue = text
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var text: Binding<String>
+        var onCommit: (() -> Void)?
+
+        init(text: Binding<String>, onCommit: (() -> Void)?) {
+            self.text = text
+            self.onCommit = onCommit
+        }
+
+        @MainActor
+        func control(
+            _ control: NSControl,
+            textView: NSTextView,
+            shouldChangeCharactersIn range: NSRange,
+            replacementString string: String?
+        ) -> Bool {
+            let currentValue = textView.string as NSString
+            let candidate = currentValue.replacingCharacters(in: range, with: string ?? "")
+            guard JSONDocument.isPotentialNumberInput(candidate) else { return false }
+            text.wrappedValue = candidate
+            return true
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let textField = notification.object as? NSTextField else { return }
+            let filteredValue = JSONDocument.filteredNumberInput(textField.stringValue)
+            if textField.stringValue != filteredValue {
+                textField.stringValue = filteredValue
+                if let editor = textField.currentEditor() {
+                    editor.selectedRange = NSRange(location: filteredValue.utf16.count, length: 0)
+                }
+            }
+            text.wrappedValue = filteredValue
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            onCommit?()
+        }
+    }
+}
+
+private final class NumericInputFormatter: Formatter {
+    override func string(for object: Any?) -> String? {
+        object as? String
+    }
+
+    override func getObjectValue(
+        _ object: AutoreleasingUnsafeMutablePointer<AnyObject?>?,
+        for string: String,
+        errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?
+    ) -> Bool {
+        guard JSONDocument.isPotentialNumberInput(string) else { return false }
+        object?.pointee = string as NSString
+        return true
+    }
+
+    override func isPartialStringValid(
+        _ partialStringPtr: AutoreleasingUnsafeMutablePointer<NSString>,
+        proposedSelectedRange proposedSelRangePtr: NSRangePointer?,
+        originalString origString: String,
+        originalSelectedRange origSelRange: NSRange,
+        errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?
+    ) -> Bool {
+        JSONDocument.isPotentialNumberInput(partialStringPtr.pointee as String)
+    }
+}
+
+private struct ScalarValueField: View {
+    let value: String
+    let kind: JSONEntryKind
+    let onCommit: (String) -> Void
+
+    @State private var draft: String
+    @FocusState private var isFocused: Bool
+
+    init(value: String, kind: JSONEntryKind, onCommit: @escaping (String) -> Void) {
+        self.value = value
+        self.kind = kind
+        self.onCommit = onCommit
+        _draft = State(initialValue: value)
+    }
+
+    var body: some View {
+        Group {
+            if kind == .number {
+                NumberTextField(text: $draft, onCommit: commit)
+            } else {
+                TextField("value", text: $draft)
+                    .font(.system(.body, design: .monospaced))
+                    .textFieldStyle(.roundedBorder)
+            }
+        }
+            .focused($isFocused)
+            .onSubmit { commit() }
+            .onChange(of: isFocused) { focused in
+                if !focused { commit() }
+            }
+            .onChange(of: value) { newValue in
+                if !isFocused { draft = newValue }
+            }
+    }
+
+    private func commit() {
+        guard draft != value else { return }
+        if kind == .number, Double(draft.trimmingCharacters(in: .whitespacesAndNewlines)) == nil {
+            draft = value
+            return
+        }
+        onCommit(draft)
+    }
+}
+
+private struct ObjectChildFieldControls: View {
+    let parentPath: [String]
+    let onAdd: ([String], String, JSONEntryKind, String, Bool) -> Void
+
+    @State private var key = ""
+    @State private var kind: JSONEntryKind = .string
+    @State private var value = ""
+    @State private var boolValue = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                TextField("new key", text: $key)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 120, idealWidth: 220)
+
+                Picker("", selection: $kind) {
+                    ForEach(JSONEntryKind.allCases) { entryKind in
+                        Text(entryKind.title).tag(entryKind)
+                    }
+                }
+                .frame(width: 140)
+                .onChange(of: kind) { newKind in
+                    if newKind == .number {
+                        value = JSONDocument.filteredNumberInput(value)
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                valueEditor
+                Button(buttonTitle) { addChild() }
+                    .disabled(
+                        key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || (kind == .number && !isValidNumber)
+                    )
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var buttonTitle: String {
+        switch kind {
+        case .array: return "Create Array"
+        case .object: return "Create Object"
+        case .bool, .string, .number, .null: return "Add Child"
+        }
+    }
+
+    @ViewBuilder
+    private var valueEditor: some View {
+        switch kind {
+        case .bool:
+            Toggle("", isOn: $boolValue)
+                .toggleStyle(.checkbox)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .null:
+            Text("null")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .array:
+            Label("Array group", systemImage: "list.bullet")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .object:
+            Label("Object group", systemImage: "curlybraces")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .string:
+            TextField("value", text: $value)
+                .textFieldStyle(.roundedBorder)
+        case .number:
+            NumberTextField(text: $value)
+        }
+    }
+
+    private var isValidNumber: Bool {
+        guard kind == .number else { return true }
+        return (try? JSONDocument.value(for: .number, raw: value)) != nil
+    }
+
+    private func addChild() {
+        let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else { return }
+        onAdd(parentPath, trimmedKey, kind, value, boolValue)
+        key = ""
+        value = ""
+        boolValue = false
+    }
+}
+
+private struct ArrayItemControls: View {
+    let arrayPath: [String]
+    let onAdd: ([String], JSONEntryKind, String, Bool) -> Void
+
+    @State private var kind: JSONEntryKind = .string
+    @State private var value = ""
+    @State private var boolValue = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Picker("", selection: $kind) {
+                ForEach(JSONEntryKind.allCases) { entryKind in
+                    Text(entryKind.title).tag(entryKind)
+                }
+            }
+            .frame(width: 120)
+            .onChange(of: kind) { newKind in
+                if newKind == .number {
+                    value = JSONDocument.filteredNumberInput(value)
+                }
+            }
+
+            valueEditor
+
+            Button("Add Array Item") {
+                onAdd(arrayPath, kind, value, boolValue)
+                value = ""
+                boolValue = false
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var valueEditor: some View {
+        switch kind {
+        case .bool:
+            Toggle("", isOn: $boolValue)
+                .toggleStyle(.checkbox)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .null:
+            Text("null")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .array:
+            Label("Array", systemImage: "list.bullet")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .object:
+            Label("Object", systemImage: "curlybraces")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .string:
+            TextField("value", text: $value)
+                .textFieldStyle(.roundedBorder)
+        case .number:
+            NumberTextField(text: $value)
+        }
+    }
+
 }
 
 struct JSONFormEditor: View {
@@ -28,9 +316,6 @@ struct JSONFormEditor: View {
     @State private var newKind: JSONEntryKind = .string
     @State private var newValue = ""
     @State private var newBoolValue = false
-    @State private var arrayItemKind: JSONEntryKind = .string
-    @State private var arrayItemValue = ""
-    @State private var arrayItemBoolValue = false
 
     var body: some View {
         ScrollView {
@@ -67,7 +352,7 @@ struct JSONFormEditor: View {
                     }
                 }
                 .frame(width: 260)
-                .onChange(of: selectedEntryID) { _, _ in
+                .onChange(of: selectedEntryID) { _ in
                     if let selectedEntry { selectedKind = selectedEntry.kind }
                 }
 
@@ -101,11 +386,19 @@ struct JSONFormEditor: View {
                     }
                 }
                 .frame(width: 140)
+                .onChange(of: newKind) { kind in
+                    if kind == .number {
+                        newValue = JSONDocument.filteredNumberInput(newValue)
+                    }
+                }
 
                 newValueEditor(kind: newKind)
 
                 Button(addFieldButtonTitle) { addField() }
-                    .disabled(newKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(
+                        newKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || (newKind == .number && !isNewNumberValid)
+                    )
             }
         }
         .padding(10)
@@ -120,9 +413,14 @@ struct JSONFormEditor: View {
             return "Create Array"
         case .object:
             return "Create Object"
-        case .bool, .string:
+        case .bool, .string, .number, .null:
             return "Add Field"
         }
+    }
+
+    private var isNewNumberValid: Bool {
+        guard newKind == .number else { return true }
+        return (try? JSONDocument.value(for: .number, raw: newValue)) != nil
     }
 
     private var addChildButtonTitle: String {
@@ -131,7 +429,7 @@ struct JSONFormEditor: View {
             return "Create Array"
         case .object:
             return "Create Object"
-        case .bool, .string:
+        case .bool, .string, .number, .null:
             return "Add Child"
         }
     }
@@ -172,6 +470,11 @@ struct JSONFormEditor: View {
             Toggle("", isOn: $newBoolValue)
                 .toggleStyle(.checkbox)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        case .null:
+            Text("null")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         case .array:
             Label("Array group", systemImage: "list.bullet")
                 .font(.caption)
@@ -187,56 +490,13 @@ struct JSONFormEditor: View {
         case .string:
             TextField("value", text: $newValue)
                 .textFieldStyle(.roundedBorder)
-        }
-    }
-
-    @ViewBuilder
-    private func arrayNewValueEditor(kind: JSONEntryKind) -> some View {
-        switch kind {
-        case .bool:
-            Toggle("", isOn: $arrayItemBoolValue)
-                .toggleStyle(.checkbox)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        case .array:
-            Label("Array", systemImage: "list.bullet")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        case .object:
-            Label("Object", systemImage: "curlybraces")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        case .string:
-            TextField("value", text: $arrayItemValue)
-                .textFieldStyle(.roundedBorder)
-        }
-    }
-
-    private func newValueForArrayItemKind(_ kind: JSONEntryKind) -> Any {
-        switch kind {
-        case .string:
-            return normalizeQuotes(arrayItemValue)
-        case .bool:
-            return arrayItemBoolValue
-        case .array:
-            return [Any]()
-        case .object:
-            return [String: Any]()
+        case .number:
+            NumberTextField(text: $newValue)
         }
     }
 
     private func newValueForSelectedKind(_ kind: JSONEntryKind) -> Any {
-        switch kind {
-        case .string:
-            return normalizeQuotes(newValue)
-        case .bool:
-            return newBoolValue
-        case .array:
-            return [Any]()
-        case .object:
-            return [String: Any]()
-        }
+        (try? JSONDocument.value(for: kind, raw: newValue, boolValue: newBoolValue)) ?? newValue
     }
 
     @ViewBuilder
@@ -263,6 +523,11 @@ struct JSONFormEditor: View {
                     ))
                     .toggleStyle(.checkbox)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                case .null:
+                    Text("null")
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 case .array:
                     Text("Array")
                         .font(.caption)
@@ -273,13 +538,13 @@ struct JSONFormEditor: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                case .string:
-                    TextField("value", text: Binding(
-                        get: { currentText(at: entry.path) },
-                        set: { setValue(at: entry.path, to: $0) }
-                    ))
-                    .font(.system(.body, design: .monospaced))
-                    .textFieldStyle(.roundedBorder)
+                case .string, .number:
+                    ScalarValueField(
+                        value: currentText(at: entry.path),
+                        kind: entry.kind
+                    ) { text in
+                        setValue(at: entry.path, to: parsedScalar(text, kind: entry.kind))
+                    }
                 }
 
                 Button(role: .destructive) { removeValue(at: entry.path) } label: {
@@ -295,19 +560,8 @@ struct JSONFormEditor: View {
                         childRow(for: child)
                     }
 
-                    HStack(spacing: 8) {
-                        TextField("new key", text: $newKey)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 220)
-                        Picker("", selection: $newKind) {
-                            ForEach(JSONEntryKind.allCases) { kind in
-                                Text(kind.title).tag(kind)
-                            }
-                        }
-                        .frame(width: 140)
-                        newValueEditor(kind: newKind)
-                        Button(addChildButtonTitle) { addField(parentPath: entry.path) }
-                            .disabled(newKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    ObjectChildFieldControls(parentPath: entry.path) { path, key, kind, value, boolValue in
+                        addField(parentPath: path, key: key, kind: kind, rawValue: value, boolValue: boolValue)
                     }
                 }
                 .padding(.leading, 24)
@@ -334,6 +588,11 @@ struct JSONFormEditor: View {
             ))
             .toggleStyle(.checkbox)
             .frame(maxWidth: .infinity, alignment: .leading)
+        case .null:
+            Text("null")
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         case .array:
             Text("Array")
                 .font(.caption)
@@ -344,13 +603,13 @@ struct JSONFormEditor: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        case .string:
-            TextField("value", text: Binding(
-                get: { currentArrayItemText(at: path, index: index) },
-                set: { setArrayItemValue(at: path, index: index, value: $0) }
-            ))
-            .font(.system(.body, design: .monospaced))
-            .textFieldStyle(.roundedBorder)
+        case .string, .number:
+            ScalarValueField(
+                value: currentArrayItemText(at: path, index: index),
+                kind: kind
+            ) { text in
+                setArrayItemValue(at: path, index: index, value: parsedScalar(text, kind: kind))
+            }
         }
     }
 
@@ -374,21 +633,8 @@ struct JSONFormEditor: View {
                 }
             }
 
-            HStack(spacing: 8) {
-                Picker("", selection: $arrayItemKind) {
-                    ForEach(JSONEntryKind.allCases) { kind in
-                        Text(kind.title).tag(kind)
-                    }
-                }
-                .frame(width: 120)
-
-                arrayNewValueEditor(kind: arrayItemKind)
-
-                Button("Add Array Item") {
-                    addArrayValue(at: entry.path, kind: arrayItemKind, raw: arrayItemValue)
-                    arrayItemValue = ""
-                    arrayItemBoolValue = false
-                }
+            ArrayItemControls(arrayPath: entry.path) { path, kind, value, boolValue in
+                addArrayValue(at: path, kind: kind, raw: value, boolValue: boolValue)
             }
         }
     }
@@ -417,6 +663,11 @@ struct JSONFormEditor: View {
                         ))
                         .toggleStyle(.checkbox)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    case .null:
+                        Text("null")
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     case .array:
                         Text("Array")
                             .font(.caption)
@@ -427,13 +678,13 @@ struct JSONFormEditor: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                    case .string:
-                        TextField("value", text: Binding(
-                            get: { currentText(at: entry.path) },
-                            set: { setValue(at: entry.path, to: $0) }
-                        ))
-                        .font(.system(.body, design: .monospaced))
-                        .textFieldStyle(.roundedBorder)
+                    case .string, .number:
+                        ScalarValueField(
+                            value: currentText(at: entry.path),
+                            kind: entry.kind
+                        ) { text in
+                            setValue(at: entry.path, to: parsedScalar(text, kind: entry.kind))
+                        }
                     }
 
                     Button(role: .destructive) { removeValue(at: entry.path) } label: {
@@ -449,22 +700,8 @@ struct JSONFormEditor: View {
                             childRow(for: child)
                         }
 
-                        HStack(spacing: 8) {
-                            TextField("new key", text: $newKey)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 220)
-
-                            Picker("", selection: $newKind) {
-                                ForEach(JSONEntryKind.allCases) { kind in
-                                    Text(kind.title).tag(kind)
-                                }
-                            }
-                            .frame(width: 140)
-
-                            newValueEditor(kind: newKind)
-
-                            Button(addChildButtonTitle) { addField(parentPath: entry.path) }
-                                .disabled(newKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        ObjectChildFieldControls(parentPath: entry.path) { path, key, kind, value, boolValue in
+                            addField(parentPath: path, key: key, kind: kind, rawValue: value, boolValue: boolValue)
                         }
                     }
                     .padding(.leading, 24)
@@ -484,10 +721,9 @@ struct JSONFormEditor: View {
 
     private func rootObject() -> [String: Any]? {
         do {
-            let normalizedText = normalizeQuotes(jsonText)
-            let object = try JSONSerialization.jsonObject(with: Data(normalizedText.utf8))
+            let object = try JSONDocument.parseObject(jsonText)
             errorText = nil
-            return object as? [String: Any]
+            return object
         } catch {
             errorText = "Invalid JSON: \(error.localizedDescription)"
             return nil
@@ -495,10 +731,7 @@ struct JSONFormEditor: View {
     }
 
     private func kind(for value: Any) -> JSONEntryKind {
-        if value is Bool { return .bool }
-        if value is [Any] { return .array }
-        if value is [String: Any] { return .object }
-        return .string
+        JSONDocument.kind(for: value)
     }
 
     private func currentValue(at path: [String]) -> Any? {
@@ -523,10 +756,6 @@ struct JSONFormEditor: View {
         currentValue(at: path) as? Bool ?? false
     }
 
-    private func currentArrayValues(at path: [String]) -> [String] {
-        currentArrayRawValues(at: path).map { normalizeQuotes(String(describing: $0)) }
-    }
-
     private func currentArrayRawValues(at path: [String]) -> [Any] {
         currentValue(at: path) as? [Any] ?? []
     }
@@ -545,10 +774,6 @@ struct JSONFormEditor: View {
         return normalizeQuotes(String(describing: value))
     }
 
-    private func setArrayValue(at path: [String], index: Int, value: String) {
-        setArrayItemValue(at: path, index: index, value: value)
-    }
-
     private func setArrayItemValue(at path: [String], index: Int, value: Any) {
         var values = currentArrayRawValues(at: path)
         guard values.indices.contains(index) else { return }
@@ -556,9 +781,15 @@ struct JSONFormEditor: View {
         setValue(at: path, to: values)
     }
 
-    private func addArrayValue(at path: [String], kind: JSONEntryKind = .string, raw: String = "") {
+    private func addArrayValue(
+        at path: [String],
+        kind: JSONEntryKind = .string,
+        raw: String = "",
+        boolValue: Bool = false
+    ) {
         var values = currentArrayRawValues(at: path)
-        values.append(newValueForArrayItemKind(kind))
+        guard let value = try? JSONDocument.value(for: kind, raw: raw, boolValue: boolValue) else { return }
+        values.append(value)
         setValue(at: path, to: values)
     }
 
@@ -569,65 +800,50 @@ struct JSONFormEditor: View {
         setValue(at: path, to: values)
     }
 
-    private func setObjectText(at path: [String], text: String) {
-        let fixedText = normalizeQuotes(text)
-        if let data = fixedText.data(using: .utf8), let parsed = try? JSONSerialization.jsonObject(with: data) {
-            setValue(at: path, to: parsed)
-        } else {
-            setValue(at: path, to: fixedText)
-        }
-    }
-
     private func setValue(at path: [String], to value: Any) {
         guard var root = rootObject() else { return }
-        setValueInObject(&root, path: path, value: normalizedValue(value))
+        JSONDocument.setValue(value, at: path, in: &root)
         write(root)
-    }
-
-    private func setValueInObject(_ object: inout [String: Any], path: [String], value: Any) {
-        guard let first = path.first else { return }
-        if path.count == 1 {
-            object[first] = value
-            return
-        }
-        var nested = object[first] as? [String: Any] ?? [:]
-        setValueInObject(&nested, path: Array(path.dropFirst()), value: value)
-        object[first] = nested
     }
 
     private func removeValue(at path: [String]) {
         guard var root = rootObject() else { return }
-        removeValueFromObject(&root, path: path)
+        JSONDocument.removeValue(at: path, in: &root)
         write(root)
     }
 
-    private func removeValueFromObject(_ object: inout [String: Any], path: [String]) {
-        guard let first = path.first else { return }
-        if path.count == 1 {
-            object.removeValue(forKey: first)
-            return
-        }
-        var nested = object[first] as? [String: Any] ?? [:]
-        removeValueFromObject(&nested, path: Array(path.dropFirst()))
-        object[first] = nested
-    }
-
     private func addField(parentPath: [String]? = nil) {
-        let key = normalizeQuotes(newKey.trimmingCharacters(in: .whitespacesAndNewlines))
-        guard !key.isEmpty, var root = rootObject() else { return }
-        let value = newValueForSelectedKind(newKind)
-
-        if let parentPath {
-            setValueInObject(&root, path: parentPath + [key], value: normalizedValue(value))
-        } else if newParent.isEmpty {
-            root[key] = normalizedValue(value)
-        } else {
-            setValueInObject(&root, path: [newParent, key], value: normalizedValue(value))
-        }
-
+        addField(
+            parentPath: parentPath,
+            key: newKey,
+            kind: newKind,
+            rawValue: newValue,
+            boolValue: newBoolValue
+        )
         newKey = ""
         newValue = ""
         newBoolValue = false
+    }
+
+    private func addField(
+        parentPath: [String]?,
+        key rawKey: String,
+        kind: JSONEntryKind,
+        rawValue: String,
+        boolValue: Bool
+    ) {
+        let key = normalizeQuotes(rawKey.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !key.isEmpty, var root = rootObject() else { return }
+        guard let value = try? JSONDocument.value(for: kind, raw: rawValue, boolValue: boolValue) else { return }
+
+        if let parentPath {
+            JSONDocument.setValue(value, at: parentPath + [key], in: &root)
+        } else if newParent.isEmpty {
+            root[key] = normalizedValue(value)
+        } else {
+            JSONDocument.setValue(value, at: [newParent, key], in: &root)
+        }
+
         write(root)
     }
 
@@ -641,8 +857,12 @@ struct JSONFormEditor: View {
         switch kind {
         case .string:
             return fixed
+        case .number:
+            return (try? JSONDocument.value(for: .number, raw: fixed)) ?? currentValue
         case .bool:
             return fixed.lowercased() == "true" || fixed == "1"
+        case .null:
+            return NSNull()
         case .array:
             return fixed.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         case .object:
@@ -655,33 +875,21 @@ struct JSONFormEditor: View {
         }
     }
 
+    private func parsedScalar(_ text: String, kind: JSONEntryKind) -> Any {
+        (try? JSONDocument.value(for: kind, raw: text)) ?? text
+    }
+
     private func normalizeQuotes(_ value: String) -> String {
-        var result = ""
-        for scalar in value.unicodeScalars {
-            switch scalar.value {
-            case 0x201C, 0x201D, 0x201E, 0x201F, 0x00AB, 0x00BB, 0xFF02:
-                result.append("\"")
-            default:
-                result.unicodeScalars.append(scalar)
-            }
-        }
-        return result
+        JSONDocument.normalizeQuotes(value)
     }
 
     private func normalizedValue(_ value: Any) -> Any {
-        if let string = value as? String { return normalizeQuotes(string) }
-        if let array = value as? [Any] { return array.map { normalizedValue($0) } }
-        if let dict = value as? [String: Any] {
-            return Dictionary(uniqueKeysWithValues: dict.map { ($0.key, normalizedValue($0.value)) })
-        }
-        return value
+        JSONDocument.normalizedValue(value)
     }
 
     private func write(_ object: [String: Any]) {
         do {
-            let normalized = normalizedValue(object)
-            let data = try JSONSerialization.data(withJSONObject: normalized, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-            jsonText = String(decoding: data, as: UTF8.self) + "\n"
+            jsonText = try JSONDocument.formattedText(from: object)
             errorText = nil
         } catch {
             errorText = "Could not build JSON: \(error.localizedDescription)"
